@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
@@ -26,13 +27,28 @@ func InstallOpenTelemetryTracer(appName, target string) (func(), error) {
 		return nil, fmt.Errorf("failed to create OTEL exporter: %w", err)
 	}
 
+	// service.version is read explicitly from OTEL_RESOURCE_ATTRIBUTES so that
+	// the test harness can inject a commit identifier (e.g. a synthetic PR tag)
+	// without rebuilding the binary.  Falls back to the binary's embedded
+	// version/revision when the env var is absent or does not contain service.version.
+	//
+	// Note: resource.New() gives earlier options higher merge priority, so
+	// resource.WithFromEnv() must not be relied on to override resource.WithAttributes().
+	serviceVersion := serviceVersionFromEnv()
+	if serviceVersion == "" {
+		serviceVersion = fmt.Sprintf("%s-%s", version.Version, version.Revision)
+	}
+
 	resources, err := resource.New(context.Background(),
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String(fmt.Sprintf("%s-%s", appName, target)),
-			semconv.ServiceVersionKey.String(fmt.Sprintf("%s-%s", version.Version, version.Revision)),
-		),
+		resource.WithFromEnv(), // other OTEL_RESOURCE_ATTRIBUTES pass through
 		resource.WithHost(),
 		resource.WithTelemetrySDK(),
+		// WithAttributes is last so service.name is always the component-specific
+		// name and service.version is the explicitly resolved value above.
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String(fmt.Sprintf("%s-%s", appName, target)),
+			semconv.ServiceVersionKey.String(serviceVersion),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialise trace resources: %w", err)
@@ -61,6 +77,18 @@ func InstallOpenTelemetryTracer(appName, target string) (func(), error) {
 	otel.SetTextMapPropagator(propagator)
 
 	return shutdown, nil
+}
+
+// serviceVersionFromEnv parses OTEL_RESOURCE_ATTRIBUTES and returns the value
+// of the "service.version" key, or an empty string if it is not present.
+func serviceVersionFromEnv() string {
+	for _, kv := range strings.Split(os.Getenv("OTEL_RESOURCE_ATTRIBUTES"), ",") {
+		kv = strings.TrimSpace(kv)
+		if after, ok := strings.CutPrefix(kv, "service.version="); ok {
+			return strings.TrimSpace(after)
+		}
+	}
+	return ""
 }
 
 type otelErrorHandlerFunc func(error)
