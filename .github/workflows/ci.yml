@@ -68,7 +68,7 @@ jobs:
           # Alloy forwards them to Grafana Cloud using OTEL_ENDPOINT + GRAFANA_USER
           # + GRAFANA_SERVICE_TOKEN secrets. Empty secrets on fork PRs are harmless —
           # Alloy simply won't connect and traces are dropped silently.
-          OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4318
           OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
 
       # ── TraceGuard ──────────────────────────────────────────────────────────
