@@ -56,10 +56,13 @@ jobs:
           GRAFANA_SERVICE_TOKEN="${{ secrets.GRAFANA_SERVICE_TOKEN }}" \
             alloy run tests/traceguard/config.alloy &
           deadline=$(( $(date +%s) + 30 ))
-          until curl -sf http://localhost:4318 >/dev/null 2>&1 || [ "$(date +%s)" -ge "$deadline" ]; do
+          until curl -sf http://localhost:12345/-/ready >/dev/null 2>&1 || [ "$(date +%s)" -ge "$deadline" ]; do
             sleep 1
           done
-          curl -sf http://localhost:4318 >/dev/null 2>&1 && echo "Alloy ready" || echo "WARNING: Alloy did not respond on :4318 — traces may not be forwarded"
+          curl -sf http://localhost:12345/-/ready >/dev/null 2>&1 && echo "Alloy ready" || echo "WARNING: Alloy did not respond on :12345 — traces may not be forwarded"
+      - name: Compute Docker host IP
+        run: echo "DOCKER_HOST_IP=$(ip route show default | awk '{print $3; exit}')" >> "$GITHUB_ENV"
+
       - name: Run Tests
         run: make ${{ matrix.test-target }}
         env:
@@ -67,7 +70,9 @@ jobs:
           # Alloy forwards them to Grafana Cloud using OTEL_ENDPOINT + GRAFANA_USER
           # + GRAFANA_SERVICE_TOKEN secrets. Empty secrets on fork PRs are harmless —
           # Alloy simply won't connect and traces are dropped silently.
-          OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4318
+          # Use the Docker bridge gateway IP so containers can reach Alloy on the host
+          # (localhost inside a container resolves to the container, not the host).
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://${{ env.DOCKER_HOST_IP }}:4318
           OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
 
       # ── TraceGuard ──────────────────────────────────────────────────────────
