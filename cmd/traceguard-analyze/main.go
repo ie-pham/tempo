@@ -51,7 +51,7 @@ import (
 
 const (
 	defaultMinSamples = 30
-	searchWindowHours = 2
+	searchWindowHours = 6
 )
 
 // ── Config ───────────────────────────────────────────────────────────────────
