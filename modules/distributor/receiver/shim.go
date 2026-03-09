@@ -362,6 +362,12 @@ func (r *receiversShim) ConsumeTraces(ctx context.Context, td ptrace.Traces) err
 	return err
 }
 
+func makeDistributorSlower(ctx context.Context) {
+	ctx, span := tracer.Start(ctx, "distributor.ConsumeTracesSLOWLY")
+	defer span.End()
+	time.Sleep(300 * time.Millisecond)
+}
+
 // GetExtensions implements component.Host
 func (r *receiversShim) GetExtensions() map[component.ID]component.Component {
 	return map[component.ID]component.Component{}
