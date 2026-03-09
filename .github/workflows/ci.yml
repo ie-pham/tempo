@@ -143,6 +143,9 @@ jobs:
     name: Run integration tests
     runs-on: ubuntu-24.04
     needs: integration-tests-validation
+    permissions:
+      contents: read        # checkout
+      pull-requests: write  # traceguard-analyze posts a PR comment
     strategy:
       fail-fast: false
       matrix:
@@ -169,6 +172,65 @@ jobs:
           go-version-file: 'go.mod'
       - name: Run Tests
         run: make ${{ matrix.test-target }}
+        env:
+          # Forwarded into Tempo containers by integration/util/harness.go so that
+          # Tempo exports its own internal traces tagged with resource.service.version.
+          # Only populated for internal PRs on grafana/tempo — empty values are
+          # harmless; the OTel SDK skips export when the endpoint is unset.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_HEADERS }}
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
+      # ── TraceGuard ──────────────────────────────────────────────────────────
+      # Analyses the traces emitted during test-e2e-api and diffs them against
+      # the base branch. Only runs for internal PRs on grafana/tempo because
+      # repository secrets are not available to fork-triggered workflows.
+
+      - name: Build traceguard-analyze
+        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        run: go build -o bin/traceguard-analyze ./cmd/traceguard-analyze
+
+      - name: Compute base commit
+        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        id: base-commit
+        run: |
+          git fetch origin "$BASE_REF" --depth=50 2>/dev/null || true
+          BASE_SHA=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null || echo "")
+          echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Base commit: ${BASE_SHA:-<none found>}"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
+      - name: Wait for trace ingestion
+        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        run: sleep 30
+
+      - name: Run TraceGuard analysis
+        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        id: traceguard
+        continue-on-error: true
+        run: ./bin/traceguard-analyze 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          MODE: remote
+          GRAFANA_TEMPO_QUERY_URL: ${{ secrets.GRAFANA_TEMPO_QUERY_URL }}
+          GRAFANA_SERVICE_TOKEN: ${{ secrets.GRAFANA_SERVICE_TOKEN }}
+          GIT_COMMIT: ${{ github.sha }}
+          BASE_COMMIT: ${{ steps.base-commit.outputs.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MIN_SAMPLES: "10"
+
+      - name: Report TraceGuard outcome
+        if: always() && matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            echo "TraceGuard analysis completed successfully."
+          else
+            echo "TraceGuard analysis encountered an error (non-blocking)."
+          fi
+        env:
+          OUTCOME: ${{ steps.traceguard.outcome }}
 
   build:
     name: Build

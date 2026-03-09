@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -462,14 +463,18 @@ func (h *TempoHarness) startMicroservices(t *testing.T, config TestHarnessConfig
 		readinessProbe = h.readinessProbe
 	}
 
+	tracingEnv := tempoTracingEnvVars()
+
 	if config.Components&componentsLiveStore != 0 {
 		liveStoreZoneA := NewTempoService("live-store-zone-a-0", "live-store", readinessProbe, nil, "-live-store.instance-availability-zone=zone-a")
+		liveStoreZoneA.SetEnvVars(tracingEnv)
 		h.Services[ServiceLiveStoreZoneA] = liveStoreZoneA
 		if err := s.StartAndWaitReady(liveStoreZoneA); err != nil {
 			return fmt.Errorf("failed to start live store zone a: %w", err)
 		}
 
 		liveStoreZoneB := NewTempoService("live-store-zone-b-0", "live-store", readinessProbe, nil, "-live-store.instance-availability-zone=zone-b")
+		liveStoreZoneB.SetEnvVars(tracingEnv)
 		h.Services[ServiceLiveStoreZoneB] = liveStoreZoneB
 		if err := s.StartAndWaitReady(liveStoreZoneB); err != nil {
 			return fmt.Errorf("failed to start live store zone b: %w", err)
@@ -477,18 +482,24 @@ func (h *TempoHarness) startMicroservices(t *testing.T, config TestHarnessConfig
 	}
 
 	if config.Components&componentsDistributor != 0 {
-		h.Services[ServiceDistributor] = NewTempoService("distributor", "distributor",
+		distributor := NewTempoService("distributor", "distributor",
 			readinessProbe,
 			[]int{14250, 4317, 4318, 9411}, // jaeger grpc ingest, otlp grpc, otlp http, zipkin ingest
 		)
+		distributor.SetEnvVars(tracingEnv)
+		h.Services[ServiceDistributor] = distributor
 		if err := s.StartAndWaitReady(h.Services[ServiceDistributor]); err != nil {
 			return fmt.Errorf("failed to start distributor: %w", err)
 		}
 	}
 
 	if config.Components&componentsQueryFrontendQuerier != 0 {
-		h.Services[ServiceQueryFrontend] = NewTempoService("query-frontend", "query-frontend", readinessProbe, nil)
-		h.Services[ServiceQuerier] = NewTempoService("querier", "querier", readinessProbe, nil)
+		queryFrontend := NewTempoService("query-frontend", "query-frontend", readinessProbe, nil)
+		queryFrontend.SetEnvVars(tracingEnv)
+		querier := NewTempoService("querier", "querier", readinessProbe, nil)
+		querier.SetEnvVars(tracingEnv)
+		h.Services[ServiceQueryFrontend] = queryFrontend
+		h.Services[ServiceQuerier] = querier
 		if err := s.StartAndWaitReady(h.Services[ServiceQueryFrontend], h.Services[ServiceQuerier]); err != nil {
 			return fmt.Errorf("failed to start query frontend and querier: %w", err)
 		}
@@ -496,6 +507,7 @@ func (h *TempoHarness) startMicroservices(t *testing.T, config TestHarnessConfig
 
 	if config.Components&componentsBlockBuilder != 0 {
 		blockBuilder := NewTempoService("block-builder-0", "block-builder", readinessProbe, nil)
+		blockBuilder.SetEnvVars(tracingEnv)
 		h.Services[ServiceBlockBuilder] = blockBuilder
 		if err := s.StartAndWaitReady(blockBuilder); err != nil {
 			return fmt.Errorf("failed to start block builder: %w", err)
@@ -503,7 +515,9 @@ func (h *TempoHarness) startMicroservices(t *testing.T, config TestHarnessConfig
 	}
 
 	if config.Components&componentsMetricsGenerator != 0 {
-		h.Services[ServiceMetricsGenerator] = NewTempoService("metrics-generator", "metrics-generator", readinessProbe, nil)
+		metricsGenerator := NewTempoService("metrics-generator", "metrics-generator", readinessProbe, nil)
+		metricsGenerator.SetEnvVars(tracingEnv)
+		h.Services[ServiceMetricsGenerator] = metricsGenerator
 		if err := s.StartAndWaitReady(h.Services[ServiceMetricsGenerator]); err != nil {
 			return fmt.Errorf("failed to start metrics generator: %w", err)
 		}
@@ -511,7 +525,9 @@ func (h *TempoHarness) startMicroservices(t *testing.T, config TestHarnessConfig
 
 	if config.Components&componentsBackendSchedulerWorker != 0 {
 		scheduler := NewTempoService("backend-scheduler", "backend-scheduler", readinessProbe, nil)
+		scheduler.SetEnvVars(tracingEnv)
 		worker := NewTempoService("backend-worker", "backend-worker", readinessProbe, nil)
+		worker.SetEnvVars(tracingEnv)
 		h.Services[ServiceBackendScheduler] = scheduler
 		h.Services[ServiceBackendWorker] = worker
 		if err := s.StartAndWaitReady(scheduler, worker); err != nil {
@@ -534,6 +550,7 @@ func (h *TempoHarness) startSingleBinary(t *testing.T) error {
 	// Create single binary service with custom readiness probe
 	// Using port 3201 for readiness to avoid conflicts with main HTTP port
 	tempo := NewTempoAllInOne(readinessProbe)
+	tempo.SetEnvVars(tempoTracingEnvVars())
 
 	h.Services[ServiceDistributor] = tempo
 	h.Services[ServiceQueryFrontend] = tempo
@@ -550,6 +567,63 @@ func (h *TempoHarness) startSingleBinary(t *testing.T) error {
 	}
 
 	return nil
+}
+
+// tempoTracingEnvVars reads standard OTEL environment variables from the host and returns
+// them for forwarding into each Tempo container. This enables Tempo's internal traces to be
+// exported to an external backend such as Grafana Cloud.
+//
+// If none of the triggering env vars are set, returns nil and no tracing is configured.
+//
+// To export to Grafana Cloud, set the following on the host before running tests:
+//
+//	OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-us-east-0.grafana.net/otlp
+//	OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64(instanceID:apiToken)>
+//	OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+func tempoTracingEnvVars() map[string]string {
+	candidates := []string{
+		"OTEL_TRACES_EXPORTER",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+		"OTEL_RESOURCE_ATTRIBUTES",
+	}
+	env := make(map[string]string)
+	for _, k := range candidates {
+		if v := os.Getenv(k); v != "" {
+			env[k] = v
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	// Inject the git commit as service.version so traces are tagged with the code version.
+	// Uses build info embedded in the test binary — no git binary required.
+	if commit := vcsRevision(); commit != "" && !strings.Contains(env["OTEL_RESOURCE_ATTRIBUTES"], "service.version") {
+		if existing := env["OTEL_RESOURCE_ATTRIBUTES"]; existing != "" {
+			env["OTEL_RESOURCE_ATTRIBUTES"] = existing + ",service.version=" + commit
+		} else {
+			env["OTEL_RESOURCE_ATTRIBUTES"] = "service.version=" + commit
+		}
+	}
+	return env
+}
+
+// vcsRevision returns the git commit SHA embedded in the test binary at build time, or empty string if unavailable.
+func vcsRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			return s.Value
+		}
+	}
+	return ""
 }
 
 // normalizeTestName creates a valid Docker service name from a test name

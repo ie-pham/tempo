@@ -1,7 +1,7 @@
 services:
   # tempo, backend and kafka
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:main-be79018
     depends_on:
       - redpanda
     command: "-target=all -config.file=/etc/tempo.yaml"
