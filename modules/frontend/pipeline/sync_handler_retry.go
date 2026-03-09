@@ -137,5 +137,5 @@ func shouldRetry(statusCode int) bool {
 func retryButSlowly(ctx context.Context) {
 	_, span := tracer.Start(ctx, "frontend.retryButSlowly")
 	defer span.End()
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(1 * time.Millisecond)
 }
