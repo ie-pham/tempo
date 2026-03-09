@@ -16,7 +16,7 @@
 // # Example invocations
 //
 //	export GRAFANA_TEMPO_QUERY_URL=https://tempo-prod-05-prod-us-central-0.grafana.net/tempo
-//	export GRAFANA_SERVICE_TOKEN=glsa_xxxxxxxxxxxxxxxxxxxx
+//	export GRAFANA_BASIC_AUTH="Basic user:pw"
 //	export GIT_COMMIT=abc1234
 //	export BASE_COMMIT=def5678
 //	export PR_NUMBER=42
@@ -27,6 +27,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,13 +35,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"encoding/hex"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
@@ -59,7 +59,7 @@ const (
 type Config struct {
 	Mode         string // "remote"
 	TempoURL     string // e.g. https://tempo.example.com (no trailing slash)
-	ServiceToken string // Bearer token for Tempo
+	Auth string // Basic auth token for Tempo
 	GitCommit    string // PR commit SHA
 	BaseCommit   string // baseline commit SHA (optional; skips diff when absent)
 	PRNumber     string
@@ -72,7 +72,7 @@ func loadConfig() (Config, error) {
 	cfg := Config{
 		Mode:         getEnv("MODE", "remote"),
 		TempoURL:     strings.TrimRight(os.Getenv("GRAFANA_TEMPO_QUERY_URL"), "/"),
-		ServiceToken: os.Getenv("GRAFANA_SERVICE_TOKEN"),
+		Auth:         os.Getenv("GRAFANA_BASIC_AUTH"),
 		GitCommit:    os.Getenv("GIT_COMMIT"),
 		BaseCommit:   os.Getenv("BASE_COMMIT"),
 		PRNumber:     os.Getenv("PR_NUMBER"),
@@ -86,8 +86,8 @@ func loadConfig() (Config, error) {
 		if cfg.TempoURL == "" {
 			missing = append(missing, "GRAFANA_TEMPO_QUERY_URL")
 		}
-		if cfg.ServiceToken == "" {
-			missing = append(missing, "GRAFANA_SERVICE_TOKEN")
+		if cfg.Auth == "" {
+			missing = append(missing, "GRAFANA_AUTH")
 		}
 		if cfg.GitCommit == "" {
 			missing = append(missing, "GIT_COMMIT")
@@ -157,6 +157,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+
+	if cfg.BaseCommit == "" {
+		fmt.Println("► BASE_COMMIT not set — auto-detecting baseline from Tempo…")
+		cfg.BaseCommit = detectBaseCommit(cfg)
+		if cfg.BaseCommit != "" {
+			fmt.Printf("  detected base: %s\n", cfg.BaseCommit)
+		} else {
+			fmt.Fprintln(os.Stderr, "  warning: no main.* or baseline.* version found in Tempo; running without baseline")
+		}
 	}
 
 	fmt.Printf("mode: remote  commit=%s  base=%s\n", cfg.GitCommit, cfg.BaseCommit)
@@ -422,7 +432,7 @@ func fetchErrorRates(cfg Config) (map[ServiceKey]ErrorRateStats, error) {
 // fetchSpanNames runs `{} | rate() by (resource.service.version, span:name)` and
 // returns the set of span names observed for the base and PR commits.
 func fetchSpanNames(cfg Config) (map[string]map[string]struct{}, error) {
-	resp, err := fetchMetricsSeries(cfg, `{} | rate() by (resource.service.version, span:name)`)
+	resp, err := fetchMetricsSeries(cfg, `{rootServiceName =~ "tempo.*" && rootServiceName !~ "tempo-all|tempo-vulture"} | rate() by (resource.service.version, span:name)`)
 	if err != nil {
 		return nil, fmt.Errorf("span names: %w", err)
 	}
@@ -434,7 +444,7 @@ func fetchSpanNames(cfg Config) (map[string]map[string]struct{}, error) {
 			switch l.Key {
 			case "resource.service.version":
 				version = l.Value.GetStringValue()
-			case "span:name":
+			case "name": // Tempo returns span:name as "name" in metrics label responses
 				spanName = l.Value.GetStringValue()
 			}
 		}
@@ -503,7 +513,9 @@ func generateReport(cfg Config, results AnalysisResults) string {
 		prDur, hasPRDur := results.Duration[prKey]
 		baseDur, hasBaseDur := results.Duration[baseKey]
 
-		if hasPRDur || hasBaseDur {
+		prDurConfident := !hasPRDur || prDur.SampleCount >= cfg.MinSamples
+		baseDurConfident := !hasBaseDur || baseDur.SampleCount >= cfg.MinSamples
+		if (hasPRDur || hasBaseDur) && prDurConfident && baseDurConfident {
 			fmt.Fprintf(&b, "**Duration** (`max_over_time`)\n\n")
 			writeCompareTable(&b, cfg, hasBase,
 				hasPRDur, hasBaseDur,
@@ -526,9 +538,6 @@ func generateReport(cfg Config, results AnalysisResults) string {
 					fmt.Fprintf(&b, "| %.2f | %.2f | %.2f | %d |\n", baseDur.MinMs, baseDur.MaxMs, baseDur.AvgMs, baseDur.SampleCount)
 				},
 			)
-			if hasPRDur && prDur.SampleCount < cfg.MinSamples {
-				fmt.Fprintf(&b, "_Low confidence: PR has only %d sample(s) (min %d)._\n", prDur.SampleCount, cfg.MinSamples)
-			}
 			fmt.Fprintf(&b, "\n")
 		}
 
@@ -672,6 +681,51 @@ func shortSHA(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+// ── Base commit detection ─────────────────────────────────────────────────────
+
+var baselineVersionRe = regexp.MustCompile(`^(main|baseline)`)
+
+// detectBaseCommit queries Tempo for all active service versions and returns
+// the one matching "main.*" or "baseline.*" with the most recent sample timestamp.
+// Returns empty string if none is found.
+func detectBaseCommit(cfg Config) string {
+	resp, err := fetchMetricsSeries(cfg, `{} | rate() by(resource.service.version)`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: base commit auto-detection failed: %v\n", err)
+		return ""
+	}
+
+	// Track the latest sample timestamp seen per matching version.
+	latestTS := make(map[string]int64)
+	for _, series := range resp.Series {
+		var version string
+		for _, l := range series.Labels {
+			if l.Key == "resource.service.version" {
+				version = l.Value.GetStringValue()
+				break
+			}
+		}
+		if version == "" || !baselineVersionRe.MatchString(version) {
+			continue
+		}
+		for _, s := range series.Samples {
+			if s.TimestampMs > latestTS[version] {
+				latestTS[version] = s.TimestampMs
+			}
+		}
+	}
+
+	var bestVersion string
+	var bestTS int64 = -1
+	for v, ts := range latestTS {
+		if ts > bestTS {
+			bestTS = ts
+			bestVersion = v
+		}
+	}
+	return bestVersion
 }
 
 // ── Span context ─────────────────────────────────────────────────────────────
@@ -933,7 +987,9 @@ func tempoGET(cfg Config, rawURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.ServiceToken)
+	if cfg.Auth != "" {
+		req.Header.Set("Authorization", cfg.Auth)
+	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -956,7 +1012,9 @@ func tempoGETProto(cfg Config, rawURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.ServiceToken)
+	if cfg.Auth != "" {
+		req.Header.Set("Authorization", cfg.Auth)
+	}
 	req.Header.Set("Accept", "application/protobuf")
 
 	resp, err := http.DefaultClient.Do(req)

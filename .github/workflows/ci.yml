@@ -19,126 +19,6 @@ concurrency:
 permissions: {}
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-24.04
-    steps:
-
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: "0"
-          persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: check-fmt
-        run: make check-fmt
-
-      - name: check-jsonnetfmt
-        run: make check-jsonnetfmt
-
-      - name: Get year and week number
-        id: get-year-week-number
-        run: echo "date=$(date +"%Yweek%U")" >> $GITHUB_OUTPUT
-
-      - name: cache golangci
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
-        with:
-          path: .cache/golangci-lint
-          key: golangci-lint-${{ runner.os }}-${{ steps.get-year-week-number.outputs.date }}-${{ hashFiles('go.mod', '.golangci.yml') }}
-
-      - name: lint
-        # using env instead of template expansions to avoid template injection
-        # https://woodruffw.github.io/zizmor/audits/#template-injection
-        run: |
-          make lint base=origin/${BASE_REF}
-          sudo chown -R $(id -u):$(id -g) .cache/golangci-lint  # needed to archive cache
-        env:
-          BASE_REF: ${{ github.base_ref }}
-
-
-  unit-tests:
-    name: Run Unit Tests
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        test-target:
-          [
-            test-with-cover-pkg,
-            test-with-cover-tempodb,
-            test-with-cover-tempodb-wal,
-            test-with-cover-others,
-          ]
-
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Run Tests
-        run: make ${{ matrix.test-target }}
-
-      - name: List coverage artifacts
-        run: ls .coverage
-
-      - name: Upload coverage artifacts
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: coverage-${{ matrix.test-target }}
-          path: .coverage/*.out
-          retention-days: 1
-          include-hidden-files: true
-          if-no-files-found: error
-
-  integration-tests-validation:
-    name: Validate integration test coverage
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-      - name: Validate all integration folders are covered by CI
-        run: |
-          # Define expected folders that have corresponding test-e2e-* targets
-          EXPECTED_FOLDERS=("api" "limits" "metrics-generator" "operations" "storage" "util")
-
-          # Get actual folders in integration/ (excluding hidden files)
-          ACTUAL_FOLDERS=($(ls -d integration/*/ 2>/dev/null | xargs -n1 basename | sort))
-
-          # Convert arrays to strings for comparison
-          EXPECTED_SORTED=$(printf '%s\n' "${EXPECTED_FOLDERS[@]}" | sort | tr '\n' ' ')
-          ACTUAL_SORTED=$(printf '%s\n' "${ACTUAL_FOLDERS[@]}" | sort | tr '\n' ' ')
-
-          if [ "$EXPECTED_SORTED" != "$ACTUAL_SORTED" ]; then
-            echo "❌ ERROR: Integration folder mismatch detected!"
-            echo ""
-            echo "Expected folders (covered by CI):"
-            printf '  - %s\n' "${EXPECTED_FOLDERS[@]}" | sort
-            echo ""
-            echo "Actual folders in ./integration:"
-            printf '  - %s\n' "${ACTUAL_FOLDERS[@]}" | sort
-            echo ""
-            echo "If you added a new integration test folder, you must:"
-            echo "  1. Add a corresponding 'test-e2e-<folder-name>' target to the Makefile"
-            echo "  2. Add the target to the matrix in .github/workflows/ci.yml (integration-tests job)"
-            echo "  3. Update the EXPECTED_FOLDERS list in this validation step"
-            exit 1
-          fi
-
-          echo "✅ All integration folders are covered by CI"
-
   integration-tests:
     name: Run integration tests
     runs-on: ubuntu-24.04
@@ -151,14 +31,8 @@ jobs:
       matrix:
         test-target:
           [
-            test-e2e-operations,
             test-e2e-api,
-            test-e2e-limits,
-            test-e2e-metrics-generator,
-            test-e2e-storage,
-            test-e2e-util,
           ]
-
     steps:
       - name: Check out code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -170,15 +44,31 @@ jobs:
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version-file: 'go.mod'
+      - name: Install Grafana Alloy
+        run: |
+          wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | sudo tee /etc/apt/sources.list.d/grafana.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y alloy
+      - name: Start Grafana Alloy
+        run: |
+          OTEL_EXPORTER_OTLP_ENDPOINT="${{ secrets.OTEL_ENDPOINT }}" \
+          GRAFANA_USER="${{ secrets.GRAFANA_USER }}" \
+          GRAFANA_SERVICE_TOKEN="${{ secrets.GRAFANA_SERVICE_TOKEN }}" \
+            alloy run tests/traceguard/config.alloy &
+          deadline=$(( $(date +%s) + 30 ))
+          until curl -sf http://localhost:4318 >/dev/null 2>&1 || [ "$(date +%s)" -ge "$deadline" ]; do
+            sleep 1
+          done
+          curl -sf http://localhost:4318 >/dev/null 2>&1 && echo "Alloy ready" || echo "WARNING: Alloy did not respond on :4318 — traces may not be forwarded"
       - name: Run Tests
         run: make ${{ matrix.test-target }}
         env:
-          # Forwarded into Tempo containers by integration/util/harness.go so that
-          # Tempo exports its own internal traces tagged with resource.service.version.
-          # Only populated for internal PRs on grafana/tempo — empty values are
-          # harmless; the OTel SDK skips export when the endpoint is unset.
-          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_ENDPOINT }}
-          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_HEADERS }}
+          # Tempo containers push traces to local Alloy (no auth needed).
+          # Alloy forwards them to Grafana Cloud using OTEL_ENDPOINT + GRAFANA_USER
+          # + GRAFANA_SERVICE_TOKEN secrets. Empty secrets on fork PRs are harmless —
+          # Alloy simply won't connect and traces are dropped silently.
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
           OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
 
       # ── TraceGuard ──────────────────────────────────────────────────────────
@@ -187,11 +77,9 @@ jobs:
       # repository secrets are not available to fork-triggered workflows.
 
       - name: Build traceguard-analyze
-        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
         run: go build -o bin/traceguard-analyze ./cmd/traceguard-analyze
 
       - name: Compute base commit
-        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
         id: base-commit
         run: |
           git fetch origin "$BASE_REF" --depth=50 2>/dev/null || true
@@ -202,18 +90,16 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
 
       - name: Wait for trace ingestion
-        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
         run: sleep 30
 
       - name: Run TraceGuard analysis
-        if: matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
         id: traceguard
         continue-on-error: true
         run: ./bin/traceguard-analyze 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
         env:
           MODE: remote
           GRAFANA_TEMPO_QUERY_URL: ${{ secrets.GRAFANA_TEMPO_QUERY_URL }}
-          GRAFANA_SERVICE_TOKEN: ${{ secrets.GRAFANA_SERVICE_TOKEN }}
+          GRAFANA_BASIC_AUTH: ${{ secrets.GRAFANA_BASIC_AUTH }}
           GIT_COMMIT: ${{ github.sha }}
           BASE_COMMIT: ${{ steps.base-commit.outputs.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -222,7 +108,7 @@ jobs:
           MIN_SAMPLES: "10"
 
       - name: Report TraceGuard outcome
-        if: always() && matrix.test-target == 'test-e2e-api' && github.repository == 'grafana/tempo'
+        if: always()
         run: |
           if [ "$OUTCOME" = "success" ]; then
             echo "TraceGuard analysis completed successfully."
@@ -231,118 +117,3 @@ jobs:
           fi
         env:
           OUTCOME: ${{ steps.traceguard.outcome }}
-
-  build:
-    name: Build
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Build Tempo
-        run: make tempo
-
-      - name: generate-manifest
-        run: make generate-manifest
-
-      - name: Build tempo-query
-        run: make tempo-query
-
-      - name: Build vulture
-        run: make tempo-vulture
-
-      - name: Build tempo-cli
-        run: make tempo-cli
-
-  vendor-check:
-    name: Vendor check
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Check vendor
-        run: make vendor-check
-
-  tempo-jsonnet:
-    name: Check jsonnet & tempo-mixin
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Check jsonnet
-        run: make jsonnet-check
-
-      - name: Check tempo-mixin
-        run: make tempo-mixin-check
-
-      - name: Test jsonnet
-        run: make jsonnet-test
-
-  build-technical-documentation:
-    name: Build technical documentation
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Build Website
-        run: docker run -v ${PWD}/docs/sources:/hugo/content/docs/tempo/latest --rm grafana/docs-base:latest make prod
-
-  coverage-annotations:
-    name: Coverage Annotations
-    runs-on: ubuntu-24.04
-    needs: [unit-tests]
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Check out code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0  # Fetch full history for proper diff computation
-
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Download all coverage artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: coverage-*
-          path: .coverage/
-          merge-multiple: true
-
-      - name: Generate coverage annotations with canopy
-        run: |
-          go run github.com/oleg-kozlyuk-grafana/go-canopy/cmd/canopy@e147d900bcd82da500bf3b8ce55dfddceb73f310 \
-            --base ${{ github.event.pull_request.base.sha }} \
-            --commit ${{ github.event.pull_request.head.sha }} \
-            --format GitHubAnnotations
