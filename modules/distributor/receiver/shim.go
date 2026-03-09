@@ -359,13 +359,14 @@ func (r *receiversShim) ConsumeTraces(ctx context.Context, td ptrace.Traces) err
 		err = wrapErrorIfRetryable(err, r.retryDelay, retryInfoEnabled)
 	}
 
+	makeDistributorSlower(ctx)
 	return err
 }
 
 func makeDistributorSlower(ctx context.Context) {
 	ctx, span := tracer.Start(ctx, "distributor.ConsumeTracesSLOWLY")
 	defer span.End()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 }
 
 // GetExtensions implements component.Host
