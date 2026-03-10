@@ -598,7 +598,7 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 func consumeInefficiently(ctx context.Context) {
 	_, span := tracer.Start(ctx, "LiveStore.consume")
 	defer span.End()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(3 * time.Millisecond)
 }
 
 func (s *LiveStore) getInstance(tenantID string) (*instance, bool) {
