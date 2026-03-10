@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -62,6 +63,7 @@ func (r retryWare) RoundTrip(req Request) (*http.Response, error) {
 		}
 
 		resp, err := r.next.RoundTrip(req)
+		retryButSlowly(ctx)
 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -130,4 +132,10 @@ func (r retryWare) RoundTrip(req Request) (*http.Response, error) {
 
 func shouldRetry(statusCode int) bool {
 	return statusCode/100 == 5
+}
+
+func retryButSlowly(ctx context.Context) {
+	_, span := tracer.Start(ctx, "frontend.retryButSlowly")
+	defer span.End()
+	time.Sleep(1 * time.Millisecond)
 }

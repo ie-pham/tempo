@@ -591,7 +591,14 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 	s.lastRecordTimeNanos.Store(lastRecord.Timestamp.UnixNano())
 
 	offset := kadm.NewOffsetFromRecord(lastRecord)
+	consumeInefficiently(ctx)
 	return &offset, nil
+}
+
+func consumeInefficiently(ctx context.Context) {
+	_, span := tracer.Start(ctx, "LiveStore.consume")
+	defer span.End()
+	time.Sleep(3 * time.Millisecond)
 }
 
 func (s *LiveStore) getInstance(tenantID string) (*instance, bool) {
