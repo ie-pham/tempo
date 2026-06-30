@@ -13,15 +13,8 @@ import (
 	"github.com/grafana/tempo/pkg/tempopb"
 )
 
-// TraceFilter filters an assembled trace. Process must not mutate its input, which may be cached.
-type TraceFilter interface {
-	Process(t *tempopb.Trace) (*tempopb.Trace, error)
-}
-
 // TraceByIDV2Options holds optional post-processing configuration for the v2 trace combiner.
 type TraceByIDV2Options struct {
-	// TraceFilter is applied first (e.g. a TraceQL spanset filter). nil = no filtering.
-	TraceFilter TraceFilter
 	// SpanPruningConfig holds processor configuration when span pruning is active. nil = off.
 	SpanPruningConfig *spanpruningprocessor.Config
 	// SpanPruningMode controls how pruning is applied. Ignored when SpanPruningConfig is nil.
@@ -79,15 +72,6 @@ func NewTraceByIDV2WithMetrics(maxBytes int, marshalingFormat api.MarshallingFor
 				if err != nil {
 					return nil, err
 				}
-			}
-
-			// TraceQL spanset filter runs before pruning so pruning operates on the already-filtered set.
-			if opts.TraceFilter != nil {
-				filtered, err := opts.TraceFilter.Process(traceResult)
-				if err != nil {
-					return nil, err
-				}
-				traceResult = filtered
 			}
 
 			// Span pruning runs last: it operates on whatever trace remains after filtering.
