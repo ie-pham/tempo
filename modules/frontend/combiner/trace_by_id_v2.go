@@ -19,32 +19,16 @@ type TraceByIDV2Options struct {
 	SpanPruningConfig *spanpruningprocessor.Config
 	// SpanPruningMode controls how pruning is applied. Ignored when SpanPruningConfig is nil.
 	SpanPruningMode api.SpanPruningMode
-	// Logger is used to log non-fatal errors such as pruning failures.
+	// Logger is used to log non-fatal pruning errors.
 	Logger log.Logger
 }
 
-// TraceByIDV2Combiner is the concrete combiner type returned by NewTypedTraceByIDV2.
-// It exposes MetricsCombiner so callers can read accumulated metrics without
-// triggering a second finalize call via GRPCFinal.
-type TraceByIDV2Combiner struct {
-	GRPCCombiner[*tempopb.TraceByIDResponse]
-	MetricsCombiner *TraceByIDMetricsCombiner
-}
-
-func NewTypedTraceByIDV2(maxBytes int, marshalingFormat api.MarshallingFormat, traceRedactor TraceRedactor, opts TraceByIDV2Options) *TraceByIDV2Combiner {
-	metricsCombiner := NewTraceByIDMetricsCombiner()
-	gc := NewTraceByIDV2WithMetrics(maxBytes, marshalingFormat, traceRedactor, opts, metricsCombiner)
-	return &TraceByIDV2Combiner{
-		GRPCCombiner:    gc.(GRPCCombiner[*tempopb.TraceByIDResponse]),
-		MetricsCombiner: metricsCombiner,
-	}
+func NewTypedTraceByIDV2(maxBytes int, marshalingFormat api.MarshallingFormat, traceRedactor TraceRedactor, opts TraceByIDV2Options) GRPCCombiner[*tempopb.TraceByIDResponse] {
+	return NewTraceByIDV2(maxBytes, marshalingFormat, traceRedactor, opts).(GRPCCombiner[*tempopb.TraceByIDResponse])
 }
 
 func NewTraceByIDV2(maxBytes int, marshalingFormat api.MarshallingFormat, traceRedactor TraceRedactor, opts TraceByIDV2Options) Combiner {
-	return NewTraceByIDV2WithMetrics(maxBytes, marshalingFormat, traceRedactor, opts, NewTraceByIDMetricsCombiner())
-}
-
-func NewTraceByIDV2WithMetrics(maxBytes int, marshalingFormat api.MarshallingFormat, traceRedactor TraceRedactor, opts TraceByIDV2Options, metricsCombiner *TraceByIDMetricsCombiner) Combiner {
+	metricsCombiner := NewTraceByIDMetricsCombiner()
 	combiner := trace.NewCombiner(maxBytes, true)
 	var partialTrace bool
 	gc := &genericCombiner[*tempopb.TraceByIDResponse]{
@@ -64,17 +48,14 @@ func NewTraceByIDV2WithMetrics(maxBytes int, marshalingFormat api.MarshallingFor
 				traceResult = &tempopb.Trace{}
 			}
 
-			// dedupe duplicate span ids
 			deduper := newDeduper()
 			traceResult = deduper.dedupe(traceResult)
 			if traceRedactor != nil {
-				err := traceRedactor.RedactTraceAttributes(traceResult)
-				if err != nil {
+				if err := traceRedactor.RedactTraceAttributes(traceResult); err != nil {
 					return nil, err
 				}
 			}
 
-			// Span pruning runs last: it operates on whatever trace remains after filtering.
 			if opts.SpanPruningConfig != nil {
 				var pruned *tempopb.Trace
 				var err error
@@ -94,7 +75,6 @@ func NewTraceByIDV2WithMetrics(maxBytes int, marshalingFormat api.MarshallingFor
 			}
 
 			resp.Trace = traceResult
-			// metrics report bytes inspected to pull the whole trace; filtering/pruning only trims output, so they are unchanged.
 			resp.Metrics = metricsCombiner.Metrics
 
 			if partialTrace || combiner.IsPartialTrace() {
